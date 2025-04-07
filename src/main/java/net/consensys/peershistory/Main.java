@@ -40,12 +40,12 @@ import java.util.stream.IntStream;
 @CommandLine.Command(name = "Peers History", version = "0.1", mixinStandardHelpOptions = true)
 public class Main implements Runnable {
   private static final int DEFAULT_SCRAPE_INTERVAL_SECONDS = 15;
+  private static final int DEFAULT_FULL_LOG_INTERVAL_SECONDS = 60 * 5;
   private static final int DEFAULT_TTL_DAYS = 365;
   private static final URI DEFAULT_RPC_URI = URI.create("http://localhost:8545");
   private static final String LOG_FILENAME = "peers-history.log";
   private static final String SQLITE_CONNECTION_URL_TPL = "jdbc:sqlite:%s";
   private static final String SQLITE_DB_FILENAME = "peers-history.sqlite";
-  private static final String LAST_FETCH_TIME_VAR_NAME = "last_fetch_time";
   private static final AtomicLong REQ_COUNTER = new AtomicLong();
   private final Logger APP_LOG = Logger.getLogger("App");
   private final Logger HISTORY_LOG = Logger.getLogger("App.History");
@@ -53,6 +53,7 @@ public class Main implements Runnable {
   private final Map<String, Integer> slotByPeerId = new HashMap<>();
   private final NavigableSet<Integer> freeSlots = new TreeSet<>();
   private final Set<String> reinsertSlotForPeerId = new HashSet<>();
+  private final Set<PeerData> prevStatus = new HashSet<>();
   private final HttpClient httpClient;
   @Option(
       names = {"-v", "--verbose"},
@@ -64,6 +65,11 @@ public class Main implements Runnable {
       description = "Scrape interval in seconds. (default: ${DEFAULT-VALUE})"
   )
   int scrapeIntervalSecs = DEFAULT_SCRAPE_INTERVAL_SECONDS;
+  @Option(
+      names = {"-l", "--full-log"},
+      description = "Interval between 2 full logs. (default: ${DEFAULT-VALUE})"
+  )
+  int fullLogIntervalSecs = DEFAULT_FULL_LOG_INTERVAL_SECONDS;
   @Option(
       names = {"-t", "--ttl"},
       description = "How many days of history to keep. (default: ${DEFAULT-VALUE})"
@@ -84,6 +90,7 @@ public class Main implements Runnable {
       description = "Execution engine RPC url to scrape. (default: ${DEFAULT-VALUE})"
   )
   URI rpcUri = DEFAULT_RPC_URI;
+  private Instant lastFullLogTime = Instant.ofEpochSecond(0);
   private Connection dbConn;
 
   public Main() {
@@ -122,7 +129,7 @@ public class Main implements Runnable {
 
     while (true) {
       try {
-        final var now = Instant.now().getEpochSecond();
+        final var now = Instant.now();
         final var peersData = fetchPeerData();
         savePeerData(now, peersData);
         logCurrentStatus(now, peersData);
@@ -246,6 +253,8 @@ public class Main implements Runnable {
 
       final var currentPeerData = fetchPeerData();
 
+      prevStatus.addAll(currentPeerData);
+
       IntStream.range(0, currentPeerData.size()).forEach(freeSlots::add);
 
       while (rs.next()) {
@@ -290,23 +299,33 @@ public class Main implements Runnable {
     ));
   }
 
-  private void logCurrentStatus(final long now, final List<PeerData> peersData) {
-    final String sb = "timestamp=" + now + ',' +
-        peersData.stream()
-            .map(pd -> slotByPeerId.get(pd.id) + "=" + pd.toMetricString())
-            .collect(Collectors.joining(","));
+  private void logCurrentStatus(final Instant now, final List<PeerData> peersData) {
+    final var newStatus = new HashSet<>(peersData);
+    final var elapsedTimeSinceLastLog = Duration.between(lastFullLogTime, now);
 
-    HISTORY_LOG.info(sb);
+    // log only if there are changes, or enough time has elapsed since the last full log
+    if (newStatus.equals(prevStatus) && elapsedTimeSinceLastLog.getSeconds() > fullLogIntervalSecs) {
+      final String sb = "timestamp=" + now.getEpochSecond() + ',' +
+          peersData.stream()
+              .map(pd -> slotByPeerId.get(pd.id) + "=" + pd.toMetricString())
+              .collect(Collectors.joining(","));
+
+      HISTORY_LOG.info(sb);
+      lastFullLogTime = now;
+    }
+
+    prevStatus.clear();
+    prevStatus.addAll(newStatus);
   }
 
-  private void savePeerData(final long now, final List<PeerData> peerData) {
+  private void savePeerData(final Instant now, final List<PeerData> peerData) {
     try (final var update = dbConn.prepareStatement("""
         UPDATE
             state
         SET
             last_fetch_time = ?
         ;""")) {
-      update.setLong(1, now);
+      update.setLong(1, now.getEpochSecond());
       update.executeUpdate();
     } catch (SQLException e) {
       APP_LOG.log(Level.WARNING, "Error saving last fetch time", e);
@@ -327,7 +346,7 @@ public class Main implements Runnable {
                     id = ?
                 AND ending IS NULL
             ;""")) {
-          update.setLong(1, now);
+          update.setLong(1, now.getEpochSecond());
           update.setString(2, entry.getKey());
           update.executeUpdate();
         } catch (SQLException e) {
@@ -341,7 +360,7 @@ public class Main implements Runnable {
     // insert newly connected peers
     peerData.stream()
         .filter(pd -> !slotByPeerId.containsKey(pd.id))
-        .forEach(pd -> saveNewPeerDataRecord(now, pd, getSlot(pd)));
+        .forEach(pd -> saveNewPeerDataRecord(now.getEpochSecond(), pd, getSlot(pd)));
 
     // special case on startup when the same peer was present also before we keep the same slot,
     // but we need to reinsert it with a new starting time
@@ -349,7 +368,7 @@ public class Main implements Runnable {
       peerData.stream()
           .filter(pd -> reinsertSlotForPeerId.contains(pd.id))
           .forEach(pd -> {
-            saveNewPeerDataRecord(now, pd, slotByPeerId.get(pd.id));
+            saveNewPeerDataRecord(now.getEpochSecond(), pd, slotByPeerId.get(pd.id));
             reinsertSlotForPeerId.remove(pd.id);
           });
     }

@@ -19,7 +19,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
 import java.util.Set;
@@ -40,7 +39,7 @@ import java.util.stream.IntStream;
 @CommandLine.Command(name = "Peers History", version = "0.1", mixinStandardHelpOptions = true)
 public class Main implements Runnable {
   private static final int DEFAULT_SCRAPE_INTERVAL_SECONDS = 15;
-  private static final int DEFAULT_FULL_LOG_INTERVAL_SECONDS = 60 * 5;
+  private static final int DEFAULT_KEEP_ALIVE_LOG_INTERVAL_SECONDS = 60 * 5;
   private static final int DEFAULT_TTL_DAYS = 365;
   private static final URI DEFAULT_RPC_URI = URI.create("http://localhost:8545");
   private static final String LOG_FILENAME = "peers-history.log";
@@ -50,10 +49,11 @@ public class Main implements Runnable {
   private final Logger APP_LOG = Logger.getLogger("App");
   private final Logger HISTORY_LOG = Logger.getLogger("App.History");
   private final ScheduledExecutorService cleanupScheduler = Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().name("CleanupExpiredPeerData").factory());
+  private final ScheduledExecutorService keepAliveLogScheduler = Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().name("KeepAliveLog").factory());
   private final Map<String, Integer> slotByPeerId = new HashMap<>();
   private final NavigableSet<Integer> freeSlots = new TreeSet<>();
   private final Set<String> reinsertSlotForPeerId = new HashSet<>();
-  private final Set<PeerData> prevStatus = new HashSet<>();
+  private final Set<PeerData> prevPeerData = new HashSet<>();
   private final HttpClient httpClient;
   @Option(
       names = {"-v", "--verbose"},
@@ -66,10 +66,10 @@ public class Main implements Runnable {
   )
   int scrapeIntervalSecs = DEFAULT_SCRAPE_INTERVAL_SECONDS;
   @Option(
-      names = {"-l", "--full-log"},
-      description = "Interval between 2 full logs. (default: ${DEFAULT-VALUE})"
+      names = {"-l", "--keep-alive-log-interval"},
+      description = "Max interval between 2 logs. (default: ${DEFAULT-VALUE})"
   )
-  int fullLogIntervalSecs = DEFAULT_FULL_LOG_INTERVAL_SECONDS;
+  int keepAliveLogIntervalSecs = DEFAULT_KEEP_ALIVE_LOG_INTERVAL_SECONDS;
   @Option(
       names = {"-t", "--ttl"},
       description = "How many days of history to keep. (default: ${DEFAULT-VALUE})"
@@ -90,11 +90,10 @@ public class Main implements Runnable {
       description = "Execution engine RPC url to scrape. (default: ${DEFAULT-VALUE})"
   )
   URI rpcUri = DEFAULT_RPC_URI;
-  private Instant lastFullLogTime = Instant.ofEpochSecond(0);
   private Connection dbConn;
+  private volatile Instant lastLogTime = Instant.ofEpochSecond(0);
 
   public Main() {
-
     httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(1))
         .build();
@@ -108,7 +107,7 @@ public class Main implements Runnable {
     System.exit(exitCode);
   }
 
-  private static boolean containsPeerDataById(final List<PeerData> peerData, final String peerId) {
+  private static boolean containsPeerDataById(final Set<PeerData> peerData, final String peerId) {
     return peerData.stream().anyMatch(pd -> pd.id.equals(peerId));
   }
 
@@ -118,6 +117,7 @@ public class Main implements Runnable {
       registerShutdownHook();
       initDb();
       cleanupScheduler.scheduleAtFixedRate(this::deleteExpiredPeerData, 0, 1, TimeUnit.DAYS);
+      keepAliveLogScheduler.schedule(this::keepAliveLog, keepAliveLogIntervalSecs, TimeUnit.SECONDS);
     } catch (final IOException | SQLException | InterruptedException e) {
       throw new RuntimeException(e);
     }
@@ -132,7 +132,7 @@ public class Main implements Runnable {
         final var now = Instant.now();
         final var peersData = fetchPeerData();
         savePeerData(now, peersData);
-        logCurrentStatus(now, peersData);
+        logIfChanged(now, peersData);
       } catch (IOException e) {
         APP_LOG.log(Level.WARNING, "Error fetching peers", e);
       } catch (InterruptedException e) {
@@ -146,7 +146,7 @@ public class Main implements Runnable {
     }
   }
 
-  private List<PeerData> fetchPeerData() throws IOException, InterruptedException {
+  private Set<PeerData> fetchPeerData() throws IOException, InterruptedException {
     final var req = HttpRequest.newBuilder()
         .uri(rpcUri)
         .timeout(Duration.ofSeconds(1))
@@ -253,7 +253,7 @@ public class Main implements Runnable {
 
       final var currentPeerData = fetchPeerData();
 
-      prevStatus.addAll(currentPeerData);
+      prevPeerData.addAll(currentPeerData);
 
       IntStream.range(0, currentPeerData.size()).forEach(freeSlots::add);
 
@@ -299,26 +299,47 @@ public class Main implements Runnable {
     ));
   }
 
-  private void logCurrentStatus(final Instant now, final List<PeerData> peersData) {
-    final var newStatus = new HashSet<>(peersData);
-    final var elapsedTimeSinceLastLog = Duration.between(lastFullLogTime, now);
-
-    // log only if there are changes, or enough time has elapsed since the last full log
-    if (newStatus.equals(prevStatus) && elapsedTimeSinceLastLog.getSeconds() > fullLogIntervalSecs) {
-      final String sb = "timestamp=" + now.getEpochSecond() + ',' +
-          peersData.stream()
-              .map(pd -> slotByPeerId.get(pd.id) + "=" + pd.toMetricString())
-              .collect(Collectors.joining(","));
-
-      HISTORY_LOG.info(sb);
-      lastFullLogTime = now;
+  private void logIfChanged(final Instant now, final Set<PeerData> peersData) {
+    // log only if there are changes
+    if (!peersData.equals(prevPeerData)) {
+      APP_LOG.fine("Logging since peer data changed");
+      performLog(now, peersData);
+      prevPeerData.clear();
+      prevPeerData.addAll(peersData);
+    } else {
+      APP_LOG.fine("Skipping log since peer data unchanged");
     }
 
-    prevStatus.clear();
-    prevStatus.addAll(newStatus);
   }
 
-  private void savePeerData(final Instant now, final List<PeerData> peerData) {
+  private void keepAliveLog() {
+    final var now = Instant.now();
+    final var duration = Duration.between(lastLogTime, now);
+    final var secsToNextKeepAlive = keepAliveLogIntervalSecs - duration.getSeconds();
+    APP_LOG.fine("Keep alive check: now: %s, lastLogTime %s, duration %s, secsToNextKeepAlive %d".formatted(now, lastLogTime, duration, secsToNextKeepAlive));
+
+    // log if enough time as passed
+    if (secsToNextKeepAlive <= 0) {
+      APP_LOG.fine("Keep alive log");
+      performLog(now, prevPeerData);
+      keepAliveLogScheduler.schedule(this::keepAliveLog, keepAliveLogIntervalSecs, TimeUnit.SECONDS);
+    } else {
+      APP_LOG.fine("Scheduling next keep alive check in %d secs".formatted(secsToNextKeepAlive));
+      keepAliveLogScheduler.schedule(this::keepAliveLog, secsToNextKeepAlive, TimeUnit.SECONDS);
+    }
+  }
+
+  private void performLog(final Instant now, final Set<PeerData> peersData) {
+    final String sb = "timestamp=" + now.getEpochSecond() + ',' +
+        peersData.stream()
+            .map(pd -> slotByPeerId.get(pd.id) + "=" + pd.toMetricString())
+            .collect(Collectors.joining(","));
+
+    HISTORY_LOG.info(sb);
+    lastLogTime = now;
+  }
+
+  private void savePeerData(final Instant now, final Set<PeerData> peerData) {
     try (final var update = dbConn.prepareStatement("""
         UPDATE
             state
@@ -435,7 +456,7 @@ public class Main implements Runnable {
     });
   }
 
-  private List<PeerData> parseResults(final JsonArray results) {
+  private Set<PeerData> parseResults(final JsonArray results) {
     return results.asList().stream().map(JsonElement::getAsJsonObject)
         .map(
             jsonObject -> {
@@ -470,7 +491,7 @@ public class Main implements Runnable {
                   ip, port
               );
             }
-        ).toList();
+        ).collect(Collectors.toUnmodifiableSet());
   }
 
   private record PeerData(String id, String elName, String elVersion, String elArch, String elRuntime,

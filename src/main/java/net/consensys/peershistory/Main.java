@@ -55,6 +55,9 @@ public class Main implements Runnable {
   private final Set<String> reinsertSlotForPeerId = new HashSet<>();
   private final Set<PeerData> prevPeerData = new HashSet<>();
   private final HttpClient httpClient;
+  private volatile Instant lastLogTime = Instant.ofEpochSecond(0);
+  private volatile boolean stopped = false;
+
   @Option(
       names = {"-v", "--verbose"},
       description = "Enable verbose output"
@@ -90,8 +93,6 @@ public class Main implements Runnable {
       description = "Execution engine RPC url to scrape. (default: ${DEFAULT-VALUE})"
   )
   URI rpcUri = DEFAULT_RPC_URI;
-  private Connection dbConn;
-  private volatile Instant lastLogTime = Instant.ofEpochSecond(0);
 
   public Main() {
     httpClient = HttpClient.newBuilder()
@@ -114,11 +115,7 @@ public class Main implements Runnable {
   private int init(final CommandLine.ParseResult parseResult) {
     try {
       initLog();
-      registerShutdownHook();
-      initDb();
-      cleanupScheduler.scheduleAtFixedRate(this::deleteExpiredPeerData, 0, 1, TimeUnit.DAYS);
-      keepAliveLogScheduler.schedule(this::keepAliveLog, keepAliveLogIntervalSecs, TimeUnit.SECONDS);
-    } catch (final IOException | SQLException | InterruptedException e) {
+    } catch (final IOException e) {
       throw new RuntimeException(e);
     }
     return new CommandLine.RunLast().execute(parseResult);
@@ -126,23 +123,30 @@ public class Main implements Runnable {
 
   @Override
   public void run() {
+    try (final var dbConn = initDb()) {
+      registerShutdownHook();
+      cleanupScheduler.scheduleAtFixedRate(() -> deleteExpiredPeerData(dbConn), 0, 1, TimeUnit.DAYS);
+      keepAliveLogScheduler.schedule(this::keepAliveLog, keepAliveLogIntervalSecs, TimeUnit.SECONDS);
 
-    while (true) {
-      try {
-        final var now = Instant.now();
-        final var peersData = fetchPeerData();
-        savePeerData(now, peersData);
-        logIfChanged(now, peersData);
-      } catch (IOException e) {
-        APP_LOG.log(Level.WARNING, "Error fetching peers", e);
-      } catch (InterruptedException e) {
-        APP_LOG.log(Level.WARNING, "Interrupted while fetching peers", e);
+      while (!stopped) {
+        try {
+          final var now = Instant.now();
+          final var peersData = fetchPeerData();
+          savePeerData(dbConn, now, peersData);
+          logIfChanged(now, peersData);
+        } catch (IOException e) {
+          APP_LOG.log(Level.WARNING, "Error fetching peers", e);
+        } catch (InterruptedException e) {
+          APP_LOG.log(Level.WARNING, "Interrupted while fetching peers", e);
+        }
+        try {
+          Thread.sleep(Duration.ofSeconds(scrapeIntervalSecs));
+        } catch (InterruptedException e) {
+          throw new RuntimeException(e);
+        }
       }
-      try {
-        Thread.sleep(Duration.ofSeconds(scrapeIntervalSecs));
-      } catch (InterruptedException e) {
-        throw new RuntimeException(e);
-      }
+    } catch (SQLException | InterruptedException | IOException e) {
+      throw new RuntimeException(e);
     }
   }
 
@@ -174,9 +178,8 @@ public class Main implements Runnable {
     HISTORY_LOG.addHandler(historyLogHandler);
   }
 
-  private void initDb() throws SQLException, IOException, InterruptedException {
-    dbConn = DriverManager.getConnection(SQLITE_CONNECTION_URL_TPL.formatted(dbDir.resolve(SQLITE_DB_FILENAME).toString()));
-
+  private Connection initDb() throws SQLException, IOException, InterruptedException {
+    final var dbConn = DriverManager.getConnection(SQLITE_CONNECTION_URL_TPL.formatted(dbDir.resolve(SQLITE_DB_FILENAME).toString()));
 
     try (final var statement = dbConn.createStatement()) {
       final long now = Instant.now().getEpochSecond();
@@ -253,8 +256,6 @@ public class Main implements Runnable {
 
       final var currentPeerData = fetchPeerData();
 
-      prevPeerData.addAll(currentPeerData);
-
       IntStream.range(0, currentPeerData.size()).forEach(freeSlots::add);
 
       while (rs.next()) {
@@ -268,32 +269,32 @@ public class Main implements Runnable {
         }
       }
     }
+    return dbConn;
   }
 
   private void registerShutdownHook() {
     Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+      stopped = true;
       cleanupScheduler.close();
-      // attempt to set the ending on all ongoing connections
-      try (final var update = dbConn.prepareStatement("""
-          UPDATE
-              history
-          SET
-              ending = ?
-          WHERE
-              ending IS NULL
-          ;""")) {
-        final var now = Instant.now().getEpochSecond();
-        update.setLong(1, now);
-        update.execute();
-        APP_LOG.fine("Set ending time for ongoing connection on shutdown");
-      } catch (final SQLException e) {
-        e.printStackTrace();
-      } finally {
-        try {
-          dbConn.close();
-        } catch (SQLException e) {
+      try (final var dbConn = DriverManager.getConnection(SQLITE_CONNECTION_URL_TPL.formatted(dbDir.resolve(SQLITE_DB_FILENAME).toString()))) {
+        // attempt to set the ending on all ongoing connections
+        try (final var update = dbConn.prepareStatement("""
+            UPDATE
+                history
+            SET
+                ending = ?
+            WHERE
+                ending IS NULL
+            ;""")) {
+          final var now = Instant.now().getEpochSecond();
+          update.setLong(1, now);
+          update.execute();
+          APP_LOG.fine("Set ending time for ongoing connection on shutdown");
+        } catch (final SQLException e) {
           e.printStackTrace();
         }
+      } catch (SQLException e) {
+        e.printStackTrace();
       }
     }
     ));
@@ -309,7 +310,6 @@ public class Main implements Runnable {
     } else {
       APP_LOG.fine("Skipping log since peer data unchanged");
     }
-
   }
 
   private void keepAliveLog() {
@@ -339,7 +339,7 @@ public class Main implements Runnable {
     lastLogTime = now;
   }
 
-  private void savePeerData(final Instant now, final Set<PeerData> peerData) {
+  private void savePeerData(final Connection dbConn, final Instant now, final Set<PeerData> peerData) {
     try (final var update = dbConn.prepareStatement("""
         UPDATE
             state
@@ -381,7 +381,7 @@ public class Main implements Runnable {
     // insert newly connected peers
     peerData.stream()
         .filter(pd -> !slotByPeerId.containsKey(pd.id))
-        .forEach(pd -> saveNewPeerDataRecord(now.getEpochSecond(), pd, getSlot(pd)));
+        .forEach(pd -> saveNewPeerDataRecord(dbConn, now.getEpochSecond(), pd, getSlot(pd)));
 
     // special case on startup when the same peer was present also before we keep the same slot,
     // but we need to reinsert it with a new starting time
@@ -389,13 +389,13 @@ public class Main implements Runnable {
       peerData.stream()
           .filter(pd -> reinsertSlotForPeerId.contains(pd.id))
           .forEach(pd -> {
-            saveNewPeerDataRecord(now.getEpochSecond(), pd, slotByPeerId.get(pd.id));
+            saveNewPeerDataRecord(dbConn, now.getEpochSecond(), pd, slotByPeerId.get(pd.id));
             reinsertSlotForPeerId.remove(pd.id);
           });
     }
   }
 
-  private void saveNewPeerDataRecord(final long now, final PeerData peerData, final int slot) {
+  private void saveNewPeerDataRecord(final Connection dbConn, final long now, final PeerData peerData, final int slot) {
 
     try (final var insert = dbConn.prepareStatement("""
         INSERT INTO
@@ -433,7 +433,7 @@ public class Main implements Runnable {
     }
   }
 
-  private void deleteExpiredPeerData() {
+  private void deleteExpiredPeerData(final Connection dbConn) {
     try (final var update = dbConn.prepareStatement("""
         DELETE FROM
             history

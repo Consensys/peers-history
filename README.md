@@ -38,3 +38,18 @@ Max interval between 2 logs. (default: 300)
 -v, --verbose            Enable verbose output
 -V, --version            Print version information and exit.
 ```
+
+
+Sample Promtail configuration:
+```
+- job_name: peers-history
+  pipeline_stages:
+  - regex:
+    expression: ^timestamp=(?P<timestamp>\d+),.*$
+  - timestamp:
+    format: Unix
+    source: timestamp
+  static_configs:
+  - labels:
+    __path__: /var/log/peers-history/peers-history.log.0
+```

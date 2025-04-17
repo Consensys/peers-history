@@ -53,3 +53,6 @@ Sample Promtail configuration:
   - labels:
     __path__: /var/log/peers-history/peers-history.log.0
 ```
+
+Sample Grafana dashboard build using Loki queries:
+![image](https://github.com/user-attachments/assets/a5e16ebd-fd48-4bee-a50d-cf07a02cc0da)

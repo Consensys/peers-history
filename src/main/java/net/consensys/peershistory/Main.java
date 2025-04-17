@@ -36,7 +36,7 @@ import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-@CommandLine.Command(name = "Peers History", version = "0.1", mixinStandardHelpOptions = true)
+@CommandLine.Command(name = "Peers History", version = "1.0.0", mixinStandardHelpOptions = true)
 public class Main implements Runnable {
   private static final int DEFAULT_SCRAPE_INTERVAL_SECONDS = 15;
   private static final int DEFAULT_KEEP_ALIVE_LOG_INTERVAL_SECONDS = 60 * 5;

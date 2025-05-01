@@ -44,14 +44,20 @@ Sample Promtail configuration:
 ```
 - job_name: peers-history
   pipeline_stages:
-  - regex:
-    expression: ^timestamp=(?P<timestamp>\d+),.*$
-  - timestamp:
-    format: Unix
-    source: timestamp
+    - regex:
+        expression: ^timestamp=(?P<timestamp>\d+),.*$
+    - timestamp:
+        format: Unix
+        source: timestamp
   static_configs:
-  - labels:
-    __path__: /var/log/peers-history/peers-history.log.0
+    - targets:
+        - localhost  
+      labels:
+        __path__: /var/log/peers-history/peers-history.log.0
+        service_name: peers-history
+        key1: value1
+        ...
+
 ```
 
 Sample Grafana dashboard build using Loki queries:
